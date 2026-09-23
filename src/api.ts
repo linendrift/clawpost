@@ -1,0 +1,669 @@
+import { Hono } from "hono";
+import { z } from "zod";
+import { getClawpostApiKey } from "./config";
+import { getDb } from "./db/client";
+import { sendEmail, replyToMessage } from "./mail";
+import { addLabels, removeLabel } from "./labels";
+import { archiveMessage, unarchiveMessage } from "./archive";
+import { searchMessages } from "./search";
+import {
+  createDraft,
+  getDraft,
+  updateDraft,
+  listDrafts,
+  sendDraft,
+  deleteDraft,
+} from "./drafts";
+import {
+  createAlias,
+  createInbox,
+  deleteAlias,
+  deleteInbox,
+  discoverRoutingRules,
+  getAlias,
+  getInbox,
+  importAlias,
+  importInbox,
+  listAliases,
+  listInboxes,
+  updateAlias,
+  updateInbox,
+} from "./routing";
+import type { Env } from "./types";
+
+const api = new Hono<{ Bindings: Env }>();
+
+const inboxSchema = z.object({
+  email: z.string().email(),
+  enabled: z.boolean().optional(),
+});
+
+const inboxUpdateSchema = z.object({
+  email: z.string().email().optional(),
+  enabled: z.boolean().optional(),
+});
+
+const inboxImportSchema = z.object({
+  email: z.string().email(),
+});
+
+const aliasSchema = z.object({
+  source: z.string().email(),
+  destinations: z.array(z.string().email()).min(1),
+  enabled: z.boolean().optional(),
+});
+
+const aliasUpdateSchema = z.object({
+  source: z.string().email().optional(),
+  destinations: z.array(z.string().email()).min(1).optional(),
+  enabled: z.boolean().optional(),
+});
+
+const aliasImportSchema = z.object({
+  source: z.string().email(),
+  destinations: z.array(z.string().email()).min(1),
+});
+
+// Auth middleware — timing-safe API key comparison
+api.use("/api/*", async (c, next) => {
+  const key = c.req.header("X-API-Key");
+  if (!key) return c.json({ error: "Missing API key" }, 401);
+
+  const expected = new TextEncoder().encode(getClawpostApiKey(c.env));
+  const provided = new TextEncoder().encode(key);
+
+  if (expected.byteLength !== provided.byteLength) {
+    return c.json({ error: "Invalid API key" }, 401);
+  }
+
+  const match = crypto.subtle.timingSafeEqual(expected, provided);
+  if (!match) return c.json({ error: "Invalid API key" }, 401);
+
+  await next();
+});
+
+// --- Resend Delivery Webhook (token-verified, outside /api/*) ---
+
+const RESEND_STATUS_MAP: Record<string, string> = {
+  "email.sent": "sent",
+  "email.delivered": "delivered",
+  "email.bounced": "bounced",
+  "email.complained": "complained",
+};
+
+api.post("/webhooks/resend", async (c) => {
+  if (c.env.RESEND_WEBHOOK_SECRET) {
+    const token = c.req.query("token");
+    if (!token) return c.json({ error: "Missing token" }, 401);
+
+    const expected = new TextEncoder().encode(c.env.RESEND_WEBHOOK_SECRET);
+    const provided = new TextEncoder().encode(token);
+
+    if (
+      expected.byteLength !== provided.byteLength ||
+      !crypto.subtle.timingSafeEqual(expected, provided)
+    ) {
+      return c.json({ error: "Invalid token" }, 401);
+    }
+  }
+
+  const payload = await c.req.json<{
+    type: string;
+    data: { email_id?: string };
+  }>();
+
+  const status = RESEND_STATUS_MAP[payload.type];
+  if (!status || !payload.data?.email_id) {
+    return c.json({ ok: true });
+  }
+
+  const db = getDb(c.env.DB);
+  await db
+    .updateTable("messages")
+    .set({ status })
+    .where("message_id", "=", payload.data.email_id)
+    .execute();
+
+  return c.json({ ok: true });
+});
+
+// --- Email Operations ---
+
+// Send email
+api.post("/api/send", async (c) => {
+  const body = await c.req.json<{
+    to: string | string[];
+    subject: string;
+    body: string;
+    cc?: string | string[];
+    bcc?: string | string[];
+    attachments?: { content?: string; filename: string; attachment_id?: string }[];
+  }>();
+
+  const db = getDb(c.env.DB);
+  const result = await sendEmail(c.env, db, body);
+  return c.json(result);
+});
+
+// Reply to message (approved only)
+api.post("/api/messages/:id/reply", async (c) => {
+  const id = c.req.param("id");
+  const body = await c.req.json<{
+    body: string;
+    attachments?: { content?: string; filename: string; attachment_id?: string }[];
+  }>();
+
+  const db = getDb(c.env.DB);
+  const msg = await db
+    .selectFrom("messages")
+    .select("approved")
+    .where("id", "=", id)
+    .executeTakeFirst();
+
+  if (!msg || msg.approved !== 1) return c.json({ error: "Not found" }, 404);
+
+  const result = await replyToMessage(c.env, db, id, body.body, body.attachments);
+  return c.json(result);
+});
+
+// --- Message Queries ---
+
+// List messages (approved, non-archived by default)
+api.get("/api/messages", async (c) => {
+  const db = getDb(c.env.DB);
+  const limit = Number(c.req.query("limit") ?? 50);
+  const offset = Number(c.req.query("offset") ?? 0);
+  const direction = c.req.query("direction");
+  const from = c.req.query("from");
+  const to = c.req.query("to");
+  const label = c.req.query("label");
+  const includeArchived = c.req.query("include_archived") === "true";
+
+  let query = db
+    .selectFrom("messages")
+    .selectAll()
+    .where("approved", "=", 1)
+    .orderBy("created_at", "desc")
+    .limit(limit)
+    .offset(offset);
+
+  if (!includeArchived) query = query.where("archived", "=", 0);
+  if (direction) query = query.where("direction", "=", direction as any);
+  if (from) query = query.where("from", "=", from);
+  if (to) query = query.where("to", "=", to);
+  if (label) {
+    query = query.where("id", "in",
+      db.selectFrom("message_labels")
+        .select("message_id")
+        .where("label", "=", label)
+    );
+  }
+
+  const messages = await query.execute();
+  return c.json(messages);
+});
+
+// Read single message (approved only)
+api.get("/api/messages/:id", async (c) => {
+  const db = getDb(c.env.DB);
+  const id = c.req.param("id");
+
+  const message = await db
+    .selectFrom("messages")
+    .selectAll()
+    .where("id", "=", id)
+    .where("approved", "=", 1)
+    .executeTakeFirst();
+
+  if (!message) return c.json({ error: "Not found" }, 404);
+
+  const attachments = await db
+    .selectFrom("attachments")
+    .selectAll()
+    .where("message_id", "=", id)
+    .execute();
+
+  const labels = await db
+    .selectFrom("message_labels")
+    .select("label")
+    .where("message_id", "=", id)
+    .execute();
+
+  return c.json({
+    ...message,
+    attachments,
+    labels: labels.map((l) => l.label),
+  });
+});
+
+// Download attachment (only from approved messages)
+api.get("/api/attachments/:id", async (c) => {
+  const db = getDb(c.env.DB);
+  const id = c.req.param("id");
+
+  const att = await db
+    .selectFrom("attachments")
+    .selectAll()
+    .where("id", "=", id)
+    .executeTakeFirst();
+
+  if (!att) return c.json({ error: "Not found" }, 404);
+
+  const msg = await db
+    .selectFrom("messages")
+    .select("approved")
+    .where("id", "=", att.message_id)
+    .executeTakeFirst();
+
+  if (!msg || msg.approved !== 1) return c.json({ error: "Not found" }, 404);
+
+  const obj = await c.env.ATTACHMENTS.get(att.r2_key);
+  if (!obj) return c.json({ error: "Attachment data not found" }, 404);
+
+  return new Response(obj.body, {
+    headers: {
+      "Content-Type": att.content_type ?? "application/octet-stream",
+      "Content-Disposition": `attachment; filename="${att.filename ?? "attachment"}"`,
+    },
+  });
+});
+
+// Search messages (FTS5 with LIKE fallback)
+api.get("/api/search", async (c) => {
+  const q = c.req.query("q");
+  const limit = Number(c.req.query("limit") ?? 20);
+  const includeArchived = c.req.query("include_archived") === "true";
+
+  if (!q) return c.json({ error: "Missing query parameter 'q'" }, 400);
+
+  const db = getDb(c.env.DB);
+  const messages = await searchMessages(db, q, limit, includeArchived);
+  return c.json(messages);
+});
+
+// --- Threads ---
+
+// List threads (only threads that have approved messages)
+api.get("/api/threads", async (c) => {
+  const db = getDb(c.env.DB);
+  const limit = Number(c.req.query("limit") ?? 50);
+  const offset = Number(c.req.query("offset") ?? 0);
+
+  const threads = await db
+    .selectFrom("threads")
+    .selectAll()
+    .where("id", "in",
+      db.selectFrom("messages")
+        .select("thread_id")
+        .where("approved", "=", 1)
+    )
+    .orderBy("last_message_at", "desc")
+    .limit(limit)
+    .offset(offset)
+    .execute();
+
+  return c.json(threads);
+});
+
+// Get thread with messages (approved messages only)
+api.get("/api/threads/:id", async (c) => {
+  const db = getDb(c.env.DB);
+  const id = c.req.param("id");
+
+  const thread = await db
+    .selectFrom("threads")
+    .selectAll()
+    .where("id", "=", id)
+    .executeTakeFirst();
+
+  if (!thread) return c.json({ error: "Not found" }, 404);
+
+  const messages = await db
+    .selectFrom("messages")
+    .selectAll()
+    .where("thread_id", "=", id)
+    .where("approved", "=", 1)
+    .orderBy("created_at", "asc")
+    .execute();
+
+  if (messages.length === 0) return c.json({ error: "Not found" }, 404);
+
+  return c.json({ ...thread, messages });
+});
+
+// --- Labels ---
+
+api.post("/api/messages/:id/labels", async (c) => {
+  const db = getDb(c.env.DB);
+  const id = c.req.param("id");
+  const { labels } = await c.req.json<{ labels: string[] }>();
+
+  const result = await addLabels(db, id, labels);
+  if (!result) return c.json({ error: "Not found" }, 404);
+  return c.json(result);
+});
+
+api.delete("/api/messages/:id/labels/:label", async (c) => {
+  const db = getDb(c.env.DB);
+  const id = c.req.param("id");
+  const label = decodeURIComponent(c.req.param("label"));
+
+  const result = await removeLabel(db, id, label);
+  if (!result) return c.json({ error: "Not found" }, 404);
+  return c.json(result);
+});
+
+// --- Archive / Unarchive ---
+
+api.post("/api/messages/:id/archive", async (c) => {
+  const db = getDb(c.env.DB);
+  const id = c.req.param("id");
+
+  const found = await archiveMessage(db, id);
+  if (!found) return c.json({ error: "Not found" }, 404);
+  return c.json({ archived: true });
+});
+
+api.post("/api/messages/:id/unarchive", async (c) => {
+  const db = getDb(c.env.DB);
+  const id = c.req.param("id");
+
+  const found = await unarchiveMessage(db, id);
+  if (!found) return c.json({ error: "Not found" }, 404);
+  return c.json({ archived: false });
+});
+
+// --- Drafts ---
+
+api.get("/api/drafts", async (c) => {
+  const db = getDb(c.env.DB);
+  const limit = Number(c.req.query("limit") ?? 50);
+  const offset = Number(c.req.query("offset") ?? 0);
+  const drafts = await listDrafts(db, limit, offset);
+  return c.json(drafts);
+});
+
+api.post("/api/drafts", async (c) => {
+  const body = await c.req.json<{
+    to?: string;
+    cc?: string;
+    bcc?: string;
+    subject?: string;
+    body_text?: string;
+    thread_id?: string;
+  }>();
+  const db = getDb(c.env.DB);
+  const result = await createDraft(db, body);
+  return c.json(result, 201);
+});
+
+api.get("/api/drafts/:id", async (c) => {
+  const db = getDb(c.env.DB);
+  const draft = await getDraft(db, c.req.param("id"));
+  if (!draft) return c.json({ error: "Not found" }, 404);
+  return c.json(draft);
+});
+
+api.put("/api/drafts/:id", async (c) => {
+  const id = c.req.param("id");
+  const body = await c.req.json<{
+    to?: string;
+    cc?: string;
+    bcc?: string;
+    subject?: string;
+    body_text?: string;
+    thread_id?: string;
+  }>();
+  const db = getDb(c.env.DB);
+  const found = await updateDraft(db, id, body);
+  if (!found) return c.json({ error: "Not found" }, 404);
+  return c.json({ id });
+});
+
+api.post("/api/drafts/:id/send", async (c) => {
+  const db = getDb(c.env.DB);
+  const result = await sendDraft(c.env, db, c.req.param("id"));
+  if ("error" in result) {
+    const status = result.error === "Draft not found" ? 404 : 400;
+    return c.json(result, status);
+  }
+  return c.json(result);
+});
+
+api.delete("/api/drafts/:id", async (c) => {
+  const db = getDb(c.env.DB);
+  const found = await deleteDraft(db, c.req.param("id"));
+  if (!found) return c.json({ error: "Not found" }, 404);
+  return c.json({ deleted: c.req.param("id") });
+});
+
+// --- Sender Approval ---
+
+// List pending messages (metadata only — no body content)
+api.get("/api/pending", async (c) => {
+  const db = getDb(c.env.DB);
+  const limit = Number(c.req.query("limit") ?? 50);
+  const offset = Number(c.req.query("offset") ?? 0);
+
+  const messages = await db
+    .selectFrom("messages")
+    .select(["id", "from", "subject", "direction", "created_at"])
+    .where("approved", "=", 0)
+    .orderBy("created_at", "desc")
+    .limit(limit)
+    .offset(offset)
+    .execute();
+
+  return c.json(messages);
+});
+
+// Approve a sender (allowlist + retroactively approve their messages)
+api.post("/api/approved-senders", async (c) => {
+  const { email, name } = await c.req.json<{ email: string; name?: string }>();
+  const db = getDb(c.env.DB);
+  const normalized = email.toLowerCase();
+
+  await db
+    .insertInto("approved_senders")
+    .values({
+      email: normalized,
+      name: name ?? null,
+      created_at: Date.now(),
+    })
+    .onConflict((oc) => oc.column("email").doUpdateSet({ name: name ?? null }))
+    .execute();
+
+  // Retroactively approve all messages from this sender
+  const result = await db
+    .updateTable("messages")
+    .set({ approved: 1 })
+    .where("from", "=", normalized)
+    .where("approved", "=", 0)
+    .execute();
+
+  return c.json({
+    email: normalized,
+    approved_count: Number(result[0]?.numUpdatedRows ?? 0),
+  });
+});
+
+// Remove an approved sender
+api.delete("/api/approved-senders/:email", async (c) => {
+  const email = decodeURIComponent(c.req.param("email")).toLowerCase();
+  const db = getDb(c.env.DB);
+
+  await db
+    .deleteFrom("approved_senders")
+    .where("email", "=", email)
+    .execute();
+
+  return c.json({ removed: email });
+});
+
+// List approved senders
+api.get("/api/approved-senders", async (c) => {
+  const db = getDb(c.env.DB);
+
+  const senders = await db
+    .selectFrom("approved_senders")
+    .selectAll()
+    .orderBy("created_at", "desc")
+    .execute();
+
+  return c.json(senders);
+});
+
+// --- Inboxes ---
+
+api.get("/api/inboxes", async (c) => {
+  const db = getDb(c.env.DB);
+  return c.json(await listInboxes(db));
+});
+
+api.post("/api/inboxes/import", async (c) => {
+  const parsed = inboxImportSchema.safeParse(await c.req.json());
+  if (!parsed.success) {
+    return c.json({ error: parsed.error.issues[0]?.message ?? "Invalid inbox import payload" }, 400);
+  }
+
+  try {
+    const db = getDb(c.env.DB);
+    const result = await importInbox(c.env, db, parsed.data);
+    return c.json(result, 201);
+  } catch (error) {
+    return c.json({ error: error instanceof Error ? error.message : "Failed to import inbox" }, 400);
+  }
+});
+
+api.post("/api/inboxes", async (c) => {
+  const parsed = inboxSchema.safeParse(await c.req.json());
+  if (!parsed.success) {
+    return c.json({ error: parsed.error.issues[0]?.message ?? "Invalid inbox payload" }, 400);
+  }
+
+  try {
+    const db = getDb(c.env.DB);
+    const result = await createInbox(c.env, db, parsed.data);
+    return c.json(result, 201);
+  } catch (error) {
+    return c.json({ error: error instanceof Error ? error.message : "Failed to create inbox" }, 400);
+  }
+});
+
+api.get("/api/inboxes/:id", async (c) => {
+  const db = getDb(c.env.DB);
+  const inbox = await getInbox(db, c.req.param("id"));
+  if (!inbox) return c.json({ error: "Not found" }, 404);
+  return c.json({ inbox });
+});
+
+api.put("/api/inboxes/:id", async (c) => {
+  const parsed = inboxUpdateSchema.safeParse(await c.req.json());
+  if (!parsed.success) {
+    return c.json({ error: parsed.error.issues[0]?.message ?? "Invalid inbox payload" }, 400);
+  }
+
+  try {
+    const db = getDb(c.env.DB);
+    const inbox = await updateInbox(c.env, db, c.req.param("id"), parsed.data);
+    if (!inbox) return c.json({ error: "Not found" }, 404);
+    return c.json(inbox);
+  } catch (error) {
+    return c.json({ error: error instanceof Error ? error.message : "Failed to update inbox" }, 400);
+  }
+});
+
+api.delete("/api/inboxes/:id", async (c) => {
+  try {
+    const db = getDb(c.env.DB);
+    const deleted = await deleteInbox(c.env, db, c.req.param("id"));
+    if (!deleted) return c.json({ error: "Not found" }, 404);
+    return c.json({ deleted });
+  } catch (error) {
+    return c.json({ error: error instanceof Error ? error.message : "Failed to delete inbox" }, 400);
+  }
+});
+
+// --- Aliases ---
+
+api.get("/api/aliases", async (c) => {
+  const db = getDb(c.env.DB);
+  return c.json(await listAliases(db));
+});
+
+api.get("/api/routing/discover", async (c) => {
+  try {
+    const db = getDb(c.env.DB);
+    const domain = c.req.query("domain");
+    const routes = await discoverRoutingRules(c.env, db, domain);
+    return c.json(routes);
+  } catch (error) {
+    return c.json({ error: error instanceof Error ? error.message : "Failed to discover routing rules" }, 400);
+  }
+});
+
+api.post("/api/aliases/import", async (c) => {
+  const parsed = aliasImportSchema.safeParse(await c.req.json());
+  if (!parsed.success) {
+    return c.json({ error: parsed.error.issues[0]?.message ?? "Invalid alias import payload" }, 400);
+  }
+
+  try {
+    const db = getDb(c.env.DB);
+    const alias = await importAlias(c.env, db, parsed.data);
+    return c.json(alias, 201);
+  } catch (error) {
+    return c.json({ error: error instanceof Error ? error.message : "Failed to import alias" }, 400);
+  }
+});
+
+api.post("/api/aliases", async (c) => {
+  const parsed = aliasSchema.safeParse(await c.req.json());
+  if (!parsed.success) {
+    return c.json({ error: parsed.error.issues[0]?.message ?? "Invalid alias payload" }, 400);
+  }
+
+  try {
+    const db = getDb(c.env.DB);
+    const alias = await createAlias(c.env, db, parsed.data);
+    return c.json(alias, 201);
+  } catch (error) {
+    return c.json({ error: error instanceof Error ? error.message : "Failed to create alias" }, 400);
+  }
+});
+
+api.get("/api/aliases/:id", async (c) => {
+  const db = getDb(c.env.DB);
+  const alias = await getAlias(db, c.req.param("id"));
+  if (!alias) return c.json({ error: "Not found" }, 404);
+  return c.json(alias);
+});
+
+api.put("/api/aliases/:id", async (c) => {
+  const parsed = aliasUpdateSchema.safeParse(await c.req.json());
+  if (!parsed.success) {
+    return c.json({ error: parsed.error.issues[0]?.message ?? "Invalid alias payload" }, 400);
+  }
+
+  try {
+    const db = getDb(c.env.DB);
+    const alias = await updateAlias(c.env, db, c.req.param("id"), parsed.data);
+    if (!alias) return c.json({ error: "Not found" }, 404);
+    return c.json(alias);
+  } catch (error) {
+    return c.json({ error: error instanceof Error ? error.message : "Failed to update alias" }, 400);
+  }
+});
+
+api.delete("/api/aliases/:id", async (c) => {
+  try {
+    const db = getDb(c.env.DB);
+    const deleted = await deleteAlias(c.env, db, c.req.param("id"));
+    if (!deleted) return c.json({ error: "Not found" }, 404);
+    return c.json({ deleted });
+  } catch (error) {
+    return c.json({ error: error instanceof Error ? error.message : "Failed to delete alias" }, 400);
+  }
+});
+
+export { api };
